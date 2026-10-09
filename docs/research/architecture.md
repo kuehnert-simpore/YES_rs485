@@ -3,19 +3,29 @@
 ## Scope and decisions
 
 This is the minimal architecture for a Windows/Tkinter engineering utility that
-supports Partlow P1160 ASCII and the documented MKS Series 275 RS-485 variant.
-It is deliberately a one-process, two-thread design: Tk owns the main thread and
-one `SerialWorker` thread owns the serial port. There is no asyncio loop,
+operates one physical RS-485 bus containing the documented Partlow P1160 ASCII
+and MKS Series 275 RS-485 variants.  The canonical inventory is always twelve
+devices: `GP` (MKS) plus `PID 1` through `PID 11` (Partlow).  Device identity
+selects the protocol; there is no selected global protocol and no one-device
+or one-profile application model.
+
+It is deliberately a one-process, two-thread design: Tk owns the main thread
+and one `SerialWorker` thread owns one serial handle.  There is no asyncio loop,
 database, service, plugin framework, or second background thread.
 
-The selected `BusMode` and `ProtocolId` are immutable for the lifetime of an
-open serial session. Changing either requires closing and reopening the port.
-That is a safety boundary, not just a UI convention.
+The operational notebook tabs are the mode authority.  `Passive`, `Master`,
+and `Slave` are `BusMode` values and may be switched on a running session.
+The worker cancels in-flight work, resets framers, and (for listening modes)
+re-applies the one selected listen UART format at the mode boundary.  Master
+retunes that same handle to the selected device's serial profile for each
+transaction.
 
-Partlow must initially use the operating system's native 7E1 configuration.
-Do not implement a 7E1-over-8N1 transformation without a separate, hardware-
-tested requirement. The existing adapter research explicitly says to configure
-7E1 rather than assume user-space parity emulation is needed.
+The application defaults are MKS/GP 9600/8N1 and the shared Partlow PID-bus
+profile 9600/7E1.  Passive and Slave use one explicit listen format (default
+9600/7E1), so one UART cannot hear 7E1 and 8N1 simultaneously.  Partlow must
+use the operating system's native 7E1 configuration; do not implement a
+7E1-over-8N1 transformation without a separate, hardware-tested requirement.
+The SH-U22C adapter's actual 7E1 support remains unverified.
 
 ## 1. Thread ownership
 
@@ -42,7 +52,7 @@ tested requirement. The existing adapter research explicitly says to configure
 
 ## 2. Public interface and lifecycle
 
-Suggested exact public surface (names may be imported directly by UI code):
+Suggested public surface (names may be imported directly by UI code):
 
 ```python
 class BusMode(Enum):
@@ -54,9 +64,13 @@ class ProtocolId(Enum):
     PARTLOW_P1160 = "partlow_p1160"
     MKS_275 = "mks_275"
 
+class DeviceId(Enum):
+    GP = "gp"
+    PID_1 = "pid_1"
+    # ... through PID_11
+
 @dataclass(frozen=True)
-class SerialSettings:
-    port: str
+class SerialFormat:
     baudrate: int
     bytesize: int
     parity: str
@@ -66,25 +80,35 @@ class SerialSettings:
     dsrdtr: bool = False
 
 @dataclass(frozen=True)
+class DeviceConfig:
+    device_id: DeviceId
+    protocol: ProtocolId       # fixed by device ID: GP=MKS, PID 1..11=Partlow
+    address: int
+    serial: SerialFormat
+    fake_values: Mapping[str, object]
+
+@dataclass(frozen=True)
 class SessionSpec:
     mode: BusMode
-    protocol: ProtocolId
-    serial: SerialSettings
+    port: str
+    devices: tuple[DeviceConfig, ...]  # complete GP + PID 1..11 inventory
+    listen_serial: SerialFormat         # one UART format for Passive/Slave
     response_timeout_s: float
     raw_capacity: int
-    slave_profile: "SlaveProfile | None" = None
-
-class SafetyArm(Enum):
-    PLC_DISCONNECTED = "plc_disconnected"       # master
-    SENSORS_DISCONNECTED = "sensors_disconnected" # slave
+    continuous_cycle_delay_s: float = 0.250
 
 class SerialWorker:
     def start(self) -> None: ...
-    def open(self, spec: SessionSpec,
-             arm: SafetyArm | None = None) -> UUID: ...
+    def open(self, spec: SessionSpec) -> UUID: ...
+    def set_mode(self, mode: BusMode) -> UUID: ...
     def close(self) -> UUID: ...
-    def submit(self, operation: "MasterOperation") -> UUID: ...
-    def replace_slave_profile(self, profile: "SlaveProfile") -> UUID: ...
+    def submit(self, device_id: DeviceId, operation: "MasterOperation") -> UUID: ...
+    def poll(self, device_id: DeviceId) -> UUID: ...
+    def poll_all_once(self) -> UUID: ...
+    def start_continuous_poll(self) -> UUID: ...
+    def stop_continuous_poll(self) -> UUID: ...
+    def replace_fake_values(self, device_id: DeviceId,
+                            values: Mapping[str, object]) -> UUID: ...
     def cancel(self, transaction_id: UUID) -> UUID: ...
     def drain_notifications(self, limit: int = 200) -> list["Notification"]: ...
     def drain_traffic(self, after_seq: int, limit: int = 1000) -> "TrafficBatch": ...
@@ -95,7 +119,7 @@ class SerialWorker:
 
 All mutating methods except `start`/`stop` enqueue a command and return its
 command or transaction UUID immediately. Results arrive as notifications.
-`open`, `close`, and `submit` never block the Tk thread.
+`open`, `close`, mode changes, and poll requests never block the Tk thread.
 
 Lifecycle is `NEW -> IDLE -> OPENING -> RUNNING -> CLOSING -> IDLE`, with
 `FAULTED` reachable from an open state and `STOPPED` terminal. `start()` is
@@ -104,20 +128,26 @@ close the handle in `finally`, and exit; it is safe to call more than once.
 Unexpected worker exceptions produce a `Faulted` notification and close the
 handle before the thread returns to `IDLE` (or `STOPPED` during shutdown).
 
-`replace_slave_profile` is legal only in a running slave session, and the
-worker installs a validated immutable snapshot between frames. `submit` is
-legal only in a running master session. `cancel` prevents later stages of a
-compound operation; it cannot promise to retract bytes already written.
+`replace_fake_values` is legal only in a running slave session, and the worker
+installs the selected device's validated values between frames. `submit` and
+the poll commands are legal only in a running master session. `cancel`
+prevents later stages of a compound operation; it cannot promise to retract
+bytes already written.
 
 Representative notifications:
 
 ```python
 StateChanged(command_id, old_state, new_state, session_summary)
+ModeChanged(command_id, old_mode, new_mode)
+ModeChangeFailed(command_id, requested_mode, reason)
 CommandRejected(command_id, reason)
 TransactionStarted(transaction_id, operation_summary)
 TransactionCompleted(transaction_id, result)
 TransactionFailed(transaction_id, failure_kind, detail)
-SlaveStateChanged(request_frame_id, state_snapshot)
+PollCycleStarted(cycle_id, continuous, total=12)
+PollCycleCompleted(cycle_id, continuous, succeeded, failed)
+DeviceStateChanged(device_id, request_frame_id, state_snapshot)
+SlaveRequestIgnored(frame_id, protocol, address, reason)
 RawRecordsDropped(total_count)
 FrameRecordsDropped(total_count)
 Faulted(command_id_or_none, exception_summary)
@@ -126,58 +156,75 @@ Faulted(command_id_or_none, exception_summary)
 Do not pass exception objects, serial handles, mutable dictionaries, or Tk
 objects across the boundary.
 
-## 3. Modes and safety invariants
+## 3. Modes and bus invariants
 
-The three modes describe a running session. `IDLE` is lifecycle state, not a
-fourth bus mode.
+The three modes describe the current operation of one running bus session.
+`IDLE` is lifecycle state, not a fourth bus mode.  The active notebook tab is
+the mode authority and can request a mode change without opening another port.
 
 ### Passive Sniffer
 
-- Opening requires no safety arm.
-- Every application write route is disabled in both validation and the worker.
-- `submit`, slave replies, startup probes, test frames, and automatic polling
-  are rejected. Opening the port itself must not toggle RTS deliberately or
-  enable `rs485_mode`; normal driver behavior remains a hardware caveat.
-- It only reads, frames, decodes, records, and reports.
+- Both protocol adapters are active for recognition: received bytes are fed to
+  Partlow and MKS framers/decoders and matching frames are reported with their
+  device when the address is known.
+- Every application write route is disabled in validation and in the worker.
+  Polls, startup probes, test frames, slave replies, and other TX commands are
+  rejected.  Opening the port itself must not deliberately toggle RTS or enable
+  `rs485_mode`; normal driver behavior remains a hardware caveat.
+- It only reads, frames, decodes, records, and reports.  The one selected
+  listen UART format is used for the entire capture; a UART cannot hear 7E1 and
+  8N1 at the same time.
 
 ### Active Master
 
-- `open` requires the non-persisted `SafetyArm.PLC_DISCONNECTED` value.
-- The UI must display the active warning continuously, not only in a dialog.
-- Only one master operation is outstanding. A second may be rejected as busy
-  (simplest first version) rather than building an implicit unbounded queue.
-- Every write originates from an accepted `MasterOperation`; there are no
-  hidden probes. State-changing MKS commands and Partlow writes are labelled
-  writes by the protocol layer, allowing the UI to require confirmation.
-- Slave emulation is disabled.
+- The Master tab selects a device for **Poll**, or starts **Poll All Once** or
+  **Continuous Scan** over all twelve devices in canonical order.
+- Before each device transaction the worker applies that device's native
+  serial profile and protocol adapter to the shared handle.  A poll cycle is
+  therefore a sequence of twelve per-device transactions, not one global
+  protocol request.
+- Every TX originates from an accepted poll or explicit `MasterOperation`; the
+  worker does not send hidden probes.  State-changing MKS commands and
+  Partlow writes remain labelled writes in the protocol layer.
+- Only one wire transaction is in flight at a time, while Poll All and
+  Continuous Scan queue the remaining devices and report cycle progress.
+  Slave emulation is disabled in this mode.
 
 ### Active Slave
 
-- `open` requires the non-persisted `SafetyArm.SENSORS_DISCONNECTED` value and
-  a validated slave profile.
-- `submit` is always rejected. The only legal transmission is a protocol reply
-  generated from a complete, valid, addressed request received in this
-  session. There are no unsolicited frames.
+- The Slave tab exposes twelve independent fake-value profiles, one for every
+  canonical device.  The worker owns live runtime values and can replace one
+  device's values between frames.
+- `submit` and poll commands are rejected.  The only legal transmission is a
+  protocol reply generated from a complete, valid, addressed request received
+  in this session; there are no unsolicited frames.
 - Unknown address, invalid syntax, and protocol-defined ignored cases follow
-  the device protocol. They must not fall through to a generic response.
-- Live emulated state is worker-owned and resets from `SlaveProfile` on open.
+  the device protocol and never fall through to a generic response.
+- Slave uses the one explicit listen UART format selected for Passive capture.
+  The single UART limitation means it cannot listen for GP/MKS 8N1 and
+  Partlow 7E1 traffic simultaneously.
 
 Global invariants:
 
-1. A live session's mode, protocol, and serial framing never mutate.
-2. No code outside `SerialWorker` accesses the serial handle.
+1. The session contains exactly twelve devices in canonical order: GP plus
+   PID 1 through PID 11.  Device identity fixes its protocol (GP=MKS,
+   PID=Partlow); there is no selected global protocol.
+2. No code outside `SerialWorker` accesses the one serial handle.
 3. PASSIVE executes zero application writes.
-4. MASTER and SLAVE cannot be active together.
-5. An active safety arm is required on every active-mode open and is never
-   restored from disk or carried across close/reopen.
-6. All TX bytes are recorded before/at the write attempt; completion records
+4. MASTER and SLAVE behavior is selected by the current operational mode; a
+   mode switch cancels pending work and resets framing before continuing.
+5. All TX bytes are recorded before/at the write attempt; completion records
    distinguish accepted-by-OS from response success.
-7. Closing or a serial fault terminates the pending transaction exactly once.
+6. Closing, a mode change, or a serial fault terminates pending work exactly
+   once.
 
 ## 4. Request/response correlation
 
-The worker serializes master operations. A protocol adapter compiles an
-operation to one or more ordered steps:
+The worker serializes master operations.  A manual Poll targets one device;
+Poll All and Continuous Scan enqueue the same per-device operation for each of
+the twelve devices.  Before compiling a queued item, the worker applies that
+device's serial format to the shared handle.  A protocol adapter then compiles
+the operation to one or more ordered steps:
 
 ```python
 @dataclass(frozen=True)
@@ -197,7 +244,8 @@ class TransactionPlan:
 Focused algorithm:
 
 ```text
-accept operation only when RUNNING/MASTER and no pending transaction
+accept operation only when RUNNING/MASTER and the requested device is known
+queue Poll All/Continuous items in canonical GP, PID 1..11 order
 adapter.compile(operation) -> validated TransactionPlan
 for each step:
     wait until protocol quiet/turnaround deadline
@@ -254,7 +302,8 @@ class TrafficRecord:
     direction: Direction
     data: bytes
     mode: BusMode
-    protocol: ProtocolId
+    protocol: ProtocolId | None
+    device_id: DeviceId | None
     transaction_id: UUID | None
     flags: frozenset[str]   # e.g. WRITE_ATTEMPT, POSSIBLE_ECHO
 
@@ -267,6 +316,7 @@ class FrameEvent:
     first_traffic_seq: int
     last_traffic_seq: int
     protocol: ProtocolId
+    device_id: DeviceId | None
     transaction_id: UUID | None
     decoded: "DecodedFrame | None"
     error: "ParseError | None"
@@ -328,21 +378,21 @@ address width. The MKS adapter must use two ASCII hexadecimal address digits.
 ## 7. Configuration model and persistence
 
 Use a versioned JSON file in the normal per-user application configuration
-directory (resolved with `platformdirs` only if that dependency is accepted;
-otherwise `%APPDATA%/YES_RS485/config.json`). Write a temporary sibling, flush,
-then atomically replace the destination. On invalid JSON, preserve the bad file
-and load defaults with a visible warning.
+directory (`%APPDATA%/YES_RS485/config.json`). Write a temporary sibling,
+flush, then atomically replace the destination. On invalid JSON, preserve the
+bad file and load defaults with a visible warning. The current persisted format
+is schema 2.
 
 ```python
 @dataclass(frozen=True)
 class AppConfig:
-    schema_version: int
-    selected_protocol: ProtocolId
+    schema_version: int = 2
     preferred_port: "PortIdentity | None"
-    protocol_profiles: dict[ProtocolId, "ProtocolProfile"]
-    slave_profiles: dict[str, "SlaveProfile"]
+    devices: tuple[DeviceConfig, ...]       # exactly GP + PID 1..11
+    passive_capture: "PassiveCaptureSettings"  # one listen UART
     response_timeout_s: float
     raw_capacity: int
+    continuous_cycle_delay_s: float
     ui: "UiPreferences"
 
 @dataclass(frozen=True)
@@ -354,18 +404,25 @@ class PortIdentity:
     description: str | None
 
 @dataclass(frozen=True)
-class ProtocolProfile:
-    serial: "SerialFormat"  # baud/data/parity/stop + false flow controls
-    device_address: int
+class PassiveCaptureSettings:
+    serial: "SerialFormat"                  # default 9600/7E1
+    response_pairing_window_s: float
 ```
 
-Validate all values on load and before open. Defaults are Partlow 4800/7E1 and
-MKS 19200/8N1. Port enumeration is runtime data, not configuration truth; show
-device, description, VID/PID, serial number, and location when available.
-Never persist a safety arm, an “active enabled” checkbox, an open-port state,
-or an accepted destructive-write confirmation. Adapter direction, isolation,
-termination, polarity, and echo behavior remain user-visible “unverified”
-facts rather than invented config defaults.
+Each `DeviceConfig` stores `device_id`, its fixed `protocol`, address, native
+serial profile, and `fake_values`.  The defaults are MKS/GP 9600/8N1 and a
+shared Partlow PID-bus profile 9600/7E1 (PID addresses initially 2 through 12).
+The passive/listen profile defaults to 9600/7E1.  Master uses the selected
+device profile at each transaction boundary; Passive and Slave use the one
+listen profile.
+
+Validate all values on load and before open.  Port enumeration is runtime data,
+not configuration truth; show device, description, VID/PID, serial number, and
+location when available.  Schema 2 deliberately has no selected global
+protocol, one shared protocol profile, one slave profile, separate mode arm,
+active checkbox, or open-port state.  Adapter direction, isolation, termination,
+polarity, and echo behavior remain user-visible “unverified” facts rather than
+invented config defaults.
 
 ## 8. Minimal module layout
 
@@ -375,13 +432,13 @@ src/yes_rs485/
     __main__.py             # composition root; launches Tk
     models.py               # enums, immutable commands/events/results
     config.py               # validation and atomic JSON persistence
-    serial_worker.py        # sole serial owner and generic transaction loop
+    serial_worker.py        # sole serial owner, modes, polls, transaction loop
     protocols/
         base.py             # small ProtocolAdapter contract/common results
         partlow.py          # framer, codec, matcher, operations, slave policy
         mks275.py           # framer, codec, matcher, operations, slave policy
     ui/
-        app.py              # root, polling, session controls/safety banner
+        app.py              # root, mode tabs, polling, session controls
         views.py            # passive/master/slave/settings/raw/timeline frames
 tests/
     test_partlow.py
@@ -394,12 +451,14 @@ Keep `views.py` together until its size demonstrably impairs maintenance.
 Likewise, do not add repositories, controllers, event buses, dependency
 injection containers, or separate threads for logging/polling.
 
-Tests should prove at minimum: native serial settings; passive zero-write;
-required active arms; close-on-fault; one outstanding request; Partlow numeric
+Tests should prove at minimum: native serial settings; passive dual-protocol
+recognition and zero-write behavior; mode switching on one handle; per-device
+Master Poll, Poll All, and Continuous scheduling; twelve independent Slave
+fake profiles; close-on-fault; one wire transaction at a time; Partlow numeric
 vectors and Type 3/4 gating; MKS spacing/hex address/CR framing and RST no-
 response behavior; negative ACK distinct from timeout; echo cannot correlate;
 split/coalesced frames; bounded raw-buffer gap reporting; wrong-address frames
-remain visible but do not satisfy a transaction; and no safety arm persistence.
+remain visible but do not satisfy a transaction; and schema-2 persistence.
 
 ## Explicit hard ambiguities
 

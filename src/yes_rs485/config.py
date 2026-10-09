@@ -1,9 +1,4 @@
-"""Versioned, atomic JSON configuration with safe defaults.
-
-Only user preferences and protocol/slave profiles are persisted.  Safety arms,
-open-port state, and destructive-write confirmations intentionally have no
-field in :class:`AppConfig`, so they cannot be restored accidentally.
-"""
+"""Versioned, atomic JSON configuration with schema-1 migration."""
 
 from __future__ import annotations
 
@@ -12,17 +7,20 @@ import os
 import tempfile
 import warnings
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from .models import (
     AppConfig,
+    CANONICAL_DEVICE_IDS,
+    DeviceConfig,
+    DeviceId,
+    MKS_DOCUMENTED_FRAMINGS,
     PassiveCaptureSettings,
     PortIdentity,
     ProtocolId,
-    ProtocolProfile,
     SerialFormat,
-    SlaveProfile,
     UiPreferences,
+    default_devices,
 )
 
 
@@ -30,45 +28,14 @@ APP_NAME = "YES_RS485"
 
 
 def default_config_path(app_name: str = APP_NAME) -> Path:
-    """Return the normal per-user config location without extra dependencies."""
-
     appdata = os.environ.get("APPDATA")
     if appdata:
         return Path(appdata) / app_name / "config.json"
-    # This is the Windows fallback used when APPDATA is unavailable in a test
-    # harness or a minimally configured process.
     return Path.home() / "AppData" / "Roaming" / app_name / "config.json"
 
 
 def default_config() -> AppConfig:
-    partlow_serial = SerialFormat(9600, 7, "E", 1)
-    mks_serial = SerialFormat(9600, 8, "N", 1)
-    return AppConfig(
-        protocol_profiles={
-            ProtocolId.PARTLOW_P1160: ProtocolProfile(
-                partlow_serial, 2
-            ),
-            ProtocolId.MKS_275: ProtocolProfile(
-                mks_serial, 1
-            ),
-        },
-        slave_profiles={
-            "partlow-default": SlaveProfile(
-                name="Partlow default", protocol=ProtocolId.PARTLOW_P1160,
-                address=1, values={"M": 0, "S": 0}
-            ),
-            "mks-default": SlaveProfile(
-                name="MKS default", protocol=ProtocolId.MKS_275,
-                address=1, values={"pressure": "0.00E+00"}
-            ),
-        },
-        partlow_bus_serial=partlow_serial,
-        partlow_addresses={pid: pid + 1 for pid in range(1, 12)},
-        passive_capture=PassiveCaptureSettings(
-            bus_baudrate=9600,
-            strategy="mixed_raw",
-        ),
-    )
+    return AppConfig()
 
 
 def _serial_to_dict(value: SerialFormat) -> dict[str, Any]:
@@ -84,13 +51,20 @@ def _serial_to_dict(value: SerialFormat) -> dict[str, Any]:
 
 
 def _serial_from_dict(value: Any) -> SerialFormat:
-    if not isinstance(value, dict):
+    if not isinstance(value, Mapping):
         raise ValueError("serial profile must be an object")
-    return SerialFormat(
-        int(value["baudrate"]), int(value["bytesize"]), str(value["parity"]),
-        float(value["stopbits"]), bool(value.get("xonxoff", False)),
-        bool(value.get("rtscts", False)), bool(value.get("dsrdtr", False)),
-    )
+    try:
+        return SerialFormat(
+            int(value["baudrate"]),
+            int(value["bytesize"]),
+            str(value["parity"]),
+            float(value["stopbits"]),
+            bool(value.get("xonxoff", False)),
+            bool(value.get("rtscts", False)),
+            bool(value.get("dsrdtr", False)),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("invalid serial profile") from exc
 
 
 def _port_to_dict(value: PortIdentity | None) -> dict[str, Any] | None:
@@ -108,149 +82,274 @@ def _port_to_dict(value: PortIdentity | None) -> dict[str, Any] | None:
 def _port_from_dict(value: Any) -> PortIdentity | None:
     if value is None:
         return None
-    if not isinstance(value, dict):
+    if not isinstance(value, Mapping):
         raise ValueError("preferred_port must be an object or null")
-    return PortIdentity(
-        device=str(value["device"]),
-        vid=None if value.get("vid") is None else int(value["vid"]),
-        pid=None if value.get("pid") is None else int(value["pid"]),
-        serial_number=value.get("serial_number"),
-        description=value.get("description"),
+    try:
+        return PortIdentity(
+            device=str(value["device"]),
+            vid=None if value.get("vid") is None else int(value["vid"]),
+            pid=None if value.get("pid") is None else int(value["pid"]),
+            serial_number=value.get("serial_number"),
+            description=value.get("description"),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("invalid preferred_port") from exc
+
+
+def _ui_from_dict(value: Any) -> UiPreferences:
+    if value is None:
+        return UiPreferences()
+    if not isinstance(value, Mapping):
+        raise ValueError("ui must be an object")
+    return UiPreferences(
+        theme=str(value.get("theme", "darkly")),
+        show_hex=bool(value.get("show_hex", True)),
+        timeline_window_s=float(value.get("timeline_window_s", 30.0)),
     )
 
 
-def config_to_dict(config: AppConfig) -> dict[str, Any]:
+def _passive_from_dict(value: Any, *, legacy: bool = False) -> PassiveCaptureSettings:
+    if value is None:
+        return PassiveCaptureSettings()
+    if not isinstance(value, Mapping):
+        raise ValueError("passive_capture must be an object")
+    if "serial" in value:
+        serial = _serial_from_dict(value["serial"])
+    elif legacy and "bus_baudrate" in value:
+        # Schema 1 represented passive capture as a baudrate/strategy pair.
+        # The old strategy carried no UART framing information, so migrate it
+        # deterministically to the documented shared 7E1 framing.
+        serial = SerialFormat(int(value["bus_baudrate"]), 7, "E", 1)
+    else:
+        serial = PassiveCaptureSettings().serial
+    return PassiveCaptureSettings(
+        serial=serial,
+        response_pairing_window_s=float(value.get("response_pairing_window_s", 0.250)),
+    )
+
+
+def _device_to_dict(device: DeviceConfig) -> dict[str, Any]:
     return {
-        "schema_version": config.schema_version,
-        "selected_protocol": config.selected_protocol.value,
-        "preferred_port": _port_to_dict(config.preferred_port),
-        "protocol_profiles": {
-            protocol.value: {
-                "serial": _serial_to_dict(profile.serial),
-                "device_address": profile.device_address,
-            }
-            for protocol, profile in config.protocol_profiles.items()
-        },
-        "partlow_bus_serial": _serial_to_dict(config.partlow_serial),
-        "partlow_addresses": {
-            str(pid): address for pid, address in config.partlow_addresses.items()
-        },
+        "device_id": device.device_id.value,
+        "protocol": device.protocol.value,
+        "address": device.address,
+        "serial": _serial_to_dict(device.serial),
+        "fake_values": dict(device.fake_values),
+    }
+
+
+def config_to_dict(config: AppConfig) -> dict[str, Any]:
+    """Convert a validated config to schema-2 JSON-compatible values.
+
+    No schema-1 selection/profile/address keys are emitted, even when a caller
+    passes a subclass or object assembled from a legacy file.
+    """
+
+    if not isinstance(config, AppConfig):
+        raise TypeError("config must be an AppConfig")
+    # AppConfig validates at construction; reconstructing also catches a
+    # maliciously altered frozen instance before it reaches disk.
+    validated = AppConfig(
+        schema_version=2,
+        preferred_port=config.preferred_port,
+        devices=tuple(config.devices),
+        passive_capture=config.passive_capture,
+        response_timeout_s=config.response_timeout_s,
+        raw_capacity=config.raw_capacity,
+        continuous_cycle_delay_s=config.continuous_cycle_delay_s,
+        ui=config.ui,
+    )
+    return {
+        "schema_version": 2,
+        "preferred_port": _port_to_dict(validated.preferred_port),
+        "devices": [_device_to_dict(device) for device in validated.devices],
         "passive_capture": {
-            "bus_baudrate": config.passive_capture.bus_baudrate,
-            "strategy": config.passive_capture.strategy,
-            "response_pairing_window_s": config.passive_capture.response_pairing_window_s,
+            "serial": _serial_to_dict(validated.passive_capture.serial),
+            "response_pairing_window_s": validated.passive_capture.response_pairing_window_s,
         },
-        "slave_profiles": {
-            name: {
-                "name": profile.name,
-                "protocol": profile.protocol.value,
-                "address": profile.address,
-                "values": dict(profile.values),
-            }
-            for name, profile in config.slave_profiles.items()
-        },
-        "response_timeout_s": config.response_timeout_s,
-        "raw_capacity": config.raw_capacity,
+        "response_timeout_s": validated.response_timeout_s,
+        "raw_capacity": validated.raw_capacity,
+        "continuous_cycle_delay_s": validated.continuous_cycle_delay_s,
         "ui": {
-            "theme": config.ui.theme,
-            "show_hex": config.ui.show_hex,
-            "timeline_window_s": config.ui.timeline_window_s,
+            "theme": validated.ui.theme,
+            "show_hex": validated.ui.show_hex,
+            "timeline_window_s": validated.ui.timeline_window_s,
         },
     }
 
 
-def config_from_dict(value: Any) -> AppConfig:
-    if not isinstance(value, dict):
-        raise ValueError("configuration root must be an object")
-    profiles: dict[ProtocolId, ProtocolProfile] = {}
-    for key, raw in dict(value.get("protocol_profiles", {})).items():
-        protocol = ProtocolId(key)
-        if not isinstance(raw, dict):
-            raise ValueError("protocol profile must be an object")
-        profiles[protocol] = ProtocolProfile(
-            _serial_from_dict(raw["serial"]), int(raw["device_address"])
+def _schema2_from_dict(value: Mapping[str, Any]) -> AppConfig:
+    raw_devices = value.get("devices")
+    if not isinstance(raw_devices, (list, tuple)):
+        raise ValueError("schema-2 devices must be an array")
+    devices: list[DeviceConfig] = []
+    for raw in raw_devices:
+        if not isinstance(raw, Mapping):
+            raise ValueError("device config must be an object")
+        if "device_id" not in raw or "protocol" not in raw or "address" not in raw or "serial" not in raw:
+            raise ValueError("device config requires device_id, protocol, address, and serial")
+        fake_values = raw.get("fake_values", {})
+        if not isinstance(fake_values, Mapping):
+            raise ValueError("fake_values must be an object")
+        devices.append(
+            DeviceConfig(
+                device_id=DeviceId(raw["device_id"]),
+                protocol=ProtocolId(raw["protocol"]),
+                address=int(raw["address"]),
+                serial=_serial_from_dict(raw["serial"]),
+                fake_values=dict(fake_values),
+            )
         )
-    slaves: dict[str, SlaveProfile] = {}
-    for key, raw in dict(value.get("slave_profiles", {})).items():
-        if not isinstance(raw, dict):
-            raise ValueError("slave profile must be an object")
-        slaves[str(key)] = SlaveProfile(
-            name=str(raw.get("name", key)),
-            protocol=ProtocolId(raw["protocol"]),
-            address=int(raw["address"]),
-            values=dict(raw.get("values", {})),
-        )
-    ui_raw = value.get("ui", {})
-    if not isinstance(ui_raw, dict):
-        raise ValueError("ui must be an object")
-    raw_partlow_serial = value.get("partlow_bus_serial", value.get("partlow_serial"))
-    partlow_bus_serial = (
-        _serial_from_dict(raw_partlow_serial)
-        if raw_partlow_serial is not None
-        else None
-    )
-    raw_addresses = value.get("partlow_addresses", {})
-    if not isinstance(raw_addresses, dict):
-        raise ValueError("partlow_addresses must be an object")
-    passive_raw = value.get("passive_capture", {})
-    if not isinstance(passive_raw, dict):
-        raise ValueError("passive_capture must be an object")
-    passive_capture = PassiveCaptureSettings(
-        bus_baudrate=int(
-            passive_raw.get("bus_baudrate", passive_raw.get("baudrate", 9600))
-        ),
-        strategy=str(passive_raw.get("strategy", passive_raw.get("capture_strategy", "mixed_raw"))),
-        response_pairing_window_s=float(
-            passive_raw.get("response_pairing_window_s", 0.250)
-        ),
-    )
-    result = AppConfig(
-        schema_version=int(value.get("schema_version", 1)),
-        selected_protocol=ProtocolId(value.get("selected_protocol", ProtocolId.PARTLOW_P1160.value)),
+    ui = _ui_from_dict(value.get("ui", {}))
+    return AppConfig(
+        schema_version=2,
         preferred_port=_port_from_dict(value.get("preferred_port")),
-        protocol_profiles=profiles,
-        slave_profiles=slaves,
+        devices=tuple(devices),
+        passive_capture=_passive_from_dict(value.get("passive_capture", {})),
         response_timeout_s=float(value.get("response_timeout_s", 1.0)),
         raw_capacity=int(value.get("raw_capacity", 10_000)),
-        ui=UiPreferences(
-            theme=str(ui_raw.get("theme", "darkly")),
-            show_hex=bool(ui_raw.get("show_hex", True)),
-            timeline_window_s=float(ui_raw.get("timeline_window_s", 30.0)),
-        ),
-        partlow_bus_serial=partlow_bus_serial,
-        partlow_addresses={int(pid): int(address) for pid, address in raw_addresses.items()},
-        passive_capture=passive_capture,
+        continuous_cycle_delay_s=float(value.get("continuous_cycle_delay_s", 0.250)),
+        ui=ui,
     )
-    # Missing profiles in an older/minimal file get safe documented defaults;
-    # explicit values still win.
-    defaults = default_config()
-    # Fill missing protocol views individually, while retaining explicit
-    # legacy/custom values and the single shared Partlow bus profile.
-    merged_profiles = dict(result.protocol_profiles)
-    for protocol, profile in defaults.protocol_profiles.items():
-        if protocol not in merged_profiles:
-            merged_profiles[protocol] = profile
-    if ProtocolId.PARTLOW_P1160 in merged_profiles:
-        merged_profiles[ProtocolId.PARTLOW_P1160] = ProtocolProfile(
-            result.partlow_serial, result.partlow_addresses[1]
-        )
-    object.__setattr__(result, "protocol_profiles", result.protocol_profiles.__class__(merged_profiles))
-    if not result.slave_profiles:
-        object.__setattr__(result, "slave_profiles", defaults.slave_profiles)
+
+
+def _legacy_profiles(value: Mapping[str, Any]) -> dict[ProtocolId, Mapping[str, Any]]:
+    raw_profiles = value.get("protocol_profiles", {})
+    if raw_profiles is None:
+        raw_profiles = {}
+    if not isinstance(raw_profiles, Mapping):
+        raise ValueError("protocol_profiles must be an object")
+    result: dict[ProtocolId, Mapping[str, Any]] = {}
+    for key, raw in raw_profiles.items():
+        try:
+            protocol = ProtocolId(key)
+        except ValueError as exc:
+            raise ValueError(f"unknown protocol profile: {key!r}") from exc
+        if not isinstance(raw, Mapping):
+            raise ValueError("protocol profile must be an object")
+        result[protocol] = raw
     return result
+
+
+def _legacy_slave_values(value: Mapping[str, Any], protocol: ProtocolId) -> Mapping[str, Any] | None:
+    raw_slaves = value.get("slave_profiles", {})
+    if raw_slaves is None:
+        raw_slaves = {}
+    if not isinstance(raw_slaves, Mapping):
+        raise ValueError("slave_profiles must be an object")
+    for _, raw in raw_slaves.items():
+        if not isinstance(raw, Mapping):
+            raise ValueError("slave profile must be an object")
+        if "protocol" not in raw:
+            raise ValueError("slave profile requires protocol")
+        try:
+            profile_protocol = ProtocolId(raw["protocol"])
+        except ValueError as exc:
+            raise ValueError("invalid slave profile protocol") from exc
+        if profile_protocol is protocol:
+            values = raw.get("values", {})
+            if not isinstance(values, Mapping):
+                raise ValueError("slave profile values must be an object")
+            return dict(values)
+    return None
+
+
+def _legacy_address_map(value: Mapping[str, Any], partlow_profile: Mapping[str, Any] | None) -> dict[int, int]:
+    raw_addresses = value.get("partlow_addresses", {})
+    if raw_addresses is None:
+        raw_addresses = {}
+    if not isinstance(raw_addresses, Mapping):
+        raise ValueError("partlow_addresses must be an object")
+    result = {number: number + 1 for number in range(1, 12)}
+    seen: set[int] = set()
+    for raw_pid, raw_address in raw_addresses.items():
+        try:
+            pid = int(raw_pid)
+            address = int(raw_address)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Partlow PID addresses must be integers") from exc
+        if pid in seen:
+            raise ValueError(f"duplicate Partlow PID number: {pid}")
+        seen.add(pid)
+        if not 1 <= pid <= 11:
+            raise ValueError("Partlow PID number must be in the range 1..11")
+        if not 1 <= address <= 99:
+            raise ValueError("Partlow device address must be in the range 1..99")
+        result[pid] = address
+    # Very old files had only one Partlow ProtocolProfile. Retain that value
+    # as PID 1 when no explicit address map exists.
+    if not raw_addresses and partlow_profile is not None and "device_address" in partlow_profile:
+        address = int(partlow_profile["device_address"])
+        if not 1 <= address <= 99:
+            raise ValueError("Partlow device address must be in the range 1..99")
+        result[1] = address
+    return result
+
+
+def _schema1_migrate(value: Mapping[str, Any]) -> AppConfig:
+    profiles = _legacy_profiles(value)
+    defaults = default_devices()
+    mks_profile = profiles.get(ProtocolId.MKS_275)
+    partlow_profile = profiles.get(ProtocolId.PARTLOW_P1160)
+
+    # Preserve an explicitly saved legacy MKS profile (including a deliberate
+    # non-default framing).  With no MKS profile, use the native GP default
+    # from ``default_devices`` (9600/8N1), not the Partlow 7E1 profile.
+    gp_serial = _serial_from_dict(mks_profile["serial"]) if mks_profile and "serial" in mks_profile else defaults[0].serial
+    gp_address = int(mks_profile.get("device_address", defaults[0].address)) if mks_profile else defaults[0].address
+    gp_values = _legacy_slave_values(value, ProtocolId.MKS_275)
+    if gp_values is None:
+        gp_values = dict(defaults[0].fake_values)
+    # DeviceConfig enforces MKS's 0..15 range and makes a bad old address a
+    # visible invalid-config fallback instead of silently correcting it.
+    devices: list[DeviceConfig] = [DeviceConfig(DeviceId.GP, ProtocolId.MKS_275, gp_address, gp_serial, dict(gp_values))]
+
+    partlow_serial_raw = value.get("partlow_bus_serial", value.get("partlow_serial"))
+    if partlow_serial_raw is None and partlow_profile and "serial" in partlow_profile:
+        partlow_serial_raw = partlow_profile["serial"]
+    partlow_serial = _serial_from_dict(partlow_serial_raw) if partlow_serial_raw is not None else defaults[1].serial
+    addresses = _legacy_address_map(value, partlow_profile)
+    pid_values = _legacy_slave_values(value, ProtocolId.PARTLOW_P1160)
+    if pid_values is None:
+        pid_values = dict(defaults[1].fake_values)
+    for number, device_id in enumerate(CANONICAL_DEVICE_IDS[1:], start=1):
+        devices.append(DeviceConfig(device_id, ProtocolId.PARTLOW_P1160, addresses[number], partlow_serial, dict(pid_values)))
+
+    return AppConfig(
+        schema_version=2,
+        preferred_port=_port_from_dict(value.get("preferred_port")),
+        devices=tuple(devices),
+        passive_capture=_passive_from_dict(value.get("passive_capture", {}), legacy=True),
+        response_timeout_s=float(value.get("response_timeout_s", 1.0)),
+        raw_capacity=int(value.get("raw_capacity", 10_000)),
+        continuous_cycle_delay_s=float(value.get("continuous_cycle_delay_s", 0.250)),
+        ui=_ui_from_dict(value.get("ui", {})),
+    )
+
+
+def config_from_dict(value: Any) -> AppConfig:
+    if not isinstance(value, Mapping):
+        raise ValueError("configuration root must be an object")
+    raw_version = value.get("schema_version", 1)
+    try:
+        schema_version = int(raw_version)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("schema_version must be an integer") from exc
+    if schema_version == 1:
+        return _schema1_migrate(value)
+    if schema_version == 2:
+        return _schema2_from_dict(value)
+    raise ValueError(f"unsupported configuration schema version: {schema_version}")
 
 
 def save_config(config: AppConfig, path: str | os.PathLike[str] | None = None) -> Path:
     """Atomically write a validated config and return its destination path."""
 
-    # Reconstructing validates externally-created dataclass subclasses and
-    # ensures the object has the current schema before serialization.
-    validated = config_from_dict(config_to_dict(config))
+    payload = config_to_dict(config)
+    validated = config_from_dict(payload)
     destination = Path(path) if path is not None else default_config_path()
     destination.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary_name = tempfile.mkstemp(
-        prefix=f".{destination.name}.", suffix=".tmp", dir=str(destination.parent)
-    )
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{destination.name}.", suffix=".tmp", dir=str(destination.parent))
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
             json.dump(config_to_dict(validated), handle, indent=2, sort_keys=True)
@@ -282,7 +381,6 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
             RuntimeWarning,
             stacklevel=2,
         )
-        # Leave the invalid file untouched so the user can inspect/recover it.
         return default_config()
 
 
