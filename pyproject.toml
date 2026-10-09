@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "yes-rs485"
+version = "0.1.0"
+description = "Small Windows RS-485 engineering utility for Partlow P1160 and MKS 275"
+requires-python = ">=3.11"
+dependencies = ["pyserial>=3.5", "ttkbootstrap>=1.10"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+pythonpath = ["src"]
