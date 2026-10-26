@@ -195,6 +195,7 @@ class DeviceStateChanged:
     device_id: DeviceId
     request_frame_id: int | None
     state_snapshot: DeviceRuntimeState
+    mode: BusMode = BusMode.PASSIVE
     kind: str = field(default="device_state_changed", init=False)
 
 
@@ -878,15 +879,58 @@ class SerialWorker:
             key = (event.raw_frame, event.first_traffic_seq, event.last_traffic_seq)
             ambiguous = spans.get(key, 0) > 1
             event = replace(event, flags=frozenset({"AMBIGUOUS_PROTOCOL"}) if ambiguous else frozenset(), device_id=None if ambiguous else self._device_for_decoded(decoded))
+            recovered_device: DeviceId | None = None
+            has_wire_address = False
+            # A malformed response has no decoded address, but a master
+            # transaction has exactly one expected target.  Preserve that
+            # attribution on the diagnostic FrameEvent before completing the
+            # transaction so the UI can mark only that card.  Protocol
+            # mismatches and ambiguous recognitions remain unassigned.
+            pending = self._pending
+            if (
+                event.error is not None
+                and not ambiguous
+                and session.spec.mode is BusMode.MASTER
+                and pending is not None
+                and pending.waiting_for_response
+                and event.protocol is session.devices[pending.device_id].protocol
+            ):
+                recovered_device = self._device_for_malformed(event)
+                has_wire_address = self._malformed_has_wire_address(event)
+                # A recoverable wire address is stronger evidence than the
+                # current target.  Only attach the transaction when the
+                # address is unknown or points at that same target; otherwise
+                # leave the frame associated with its diagnostic address (the
+                # UI resolves that address to one card).
+                if (recovered_device is None and not self._malformed_has_wire_address(event)) or recovered_device is pending.device_id:
+                    event = replace(event, device_id=pending.device_id, transaction_id=pending.transaction_id,
+                                    flags=frozenset(set(event.flags) | {"TRANSACTION_TARGET"}))
             self._append_frame(event)
             if event.error is not None or ambiguous:
                 if ambiguous and session.spec.mode is BusMode.SLAVE:
                     self._notify(SlaveRequestIgnored(event.frame_id, event.protocol, getattr(decoded, "address", None), "ambiguous_protocol"))
                 elif event.error is not None and session.spec.mode is BusMode.SLAVE:
                     self._notify(SlaveRequestIgnored(event.frame_id, event.protocol, None, "parse_error"))
-                elif event.error is not None and session.spec.mode is BusMode.MASTER and self._pending is not None:
+                elif (
+                    event.error is not None
+                    and session.spec.mode is BusMode.MASTER
+                    and self._pending is not None
+                    and self._pending.waiting_for_response
+                ):
                     target_protocol = session.devices[self._pending.device_id].protocol
-                    if event.protocol is target_protocol:
+                    # A malformed frame addressed to another device (or to an
+                    # unknown address) is diagnostic traffic, not evidence
+                    # that the current request failed.  Keep waiting for the
+                    # pending target; only the absent/unrecoverable-address
+                    # fallback or the pending device's own address completes
+                    # the transaction here.
+                    if (
+                        event.protocol is target_protocol
+                        and (
+                            recovered_device is self._pending.device_id
+                            or (recovered_device is None and not has_wire_address)
+                        )
+                    ):
                         self._finish_pending("protocol_error", event.error.message)
                 continue
             if session.spec.mode is BusMode.MASTER:
@@ -942,7 +986,7 @@ class SerialWorker:
         else:
             return
         session.runtime[device_id] = new_state
-        self._notify(DeviceStateChanged(device_id, event.frame_id, new_state))
+        self._notify(DeviceStateChanged(device_id, event.frame_id, new_state, session.spec.mode))
 
     @staticmethod
     def _feed_protocol_framer(protocol: ProtocolId, framer: Any, data: bytes) -> list[bytes]:
@@ -1030,7 +1074,7 @@ class SerialWorker:
         if state_after is not None:
             state = DeviceRuntimeState(device_id, state.address, dict(state_after.values), state_after.pending_parameter, state_after.pending_data)
             session.runtime[device_id] = state
-            self._notify(DeviceStateChanged(device_id, event.frame_id, state))
+            self._notify(DeviceStateChanged(device_id, event.frame_id, state, session.spec.mode))
         data = getattr(decision, "data", None)
         if data is None:
             return
@@ -1103,7 +1147,23 @@ class SerialWorker:
         self._append_frame(self._make_frame(protocol, raw, Direction.TX, seq, seq, decoded, error, device_id, transaction_id))
 
     def _make_frame(self, protocol: ProtocolId, raw: bytes, direction: Direction, first: int | None, last: int | None, decoded: Any, error: ParseError | None, device_id: DeviceId | None = None, transaction_id: UUID | None = None) -> FrameEvent:
-        frame = FrameEvent(self._next_frame_id, time.monotonic_ns(), direction, bytes(raw), first or 0, last or first or 0, protocol, device_id, transaction_id, decoded, error)
+        session = self._session
+        mode = session.spec.mode if session is not None else BusMode.PASSIVE
+        frame = FrameEvent(
+            self._next_frame_id,
+            time.monotonic_ns(),
+            direction,
+            bytes(raw),
+            first or 0,
+            last or first or 0,
+            protocol,
+            device_id,
+            transaction_id,
+            decoded,
+            error,
+            mode=mode,
+            wall_time_utc=self._wall_clock(),
+        )
         self._next_frame_id += 1
         return frame
 
@@ -1114,6 +1174,59 @@ class SerialWorker:
             return self._session.routes.get((ProtocolId(decoded.protocol), getattr(decoded, "address", None)))
         except (AttributeError, ValueError):
             return None
+
+    def _device_for_malformed(self, event: FrameEvent) -> DeviceId | None:
+        """Return one route for an address that survived a parse failure."""
+
+        session = self._session
+        if session is None:
+            return None
+        raw = getattr(getattr(event, "error", None), "raw", b"") or event.raw_frame
+        try:
+            wire = bytes(raw)
+        except (TypeError, ValueError):
+            return None
+        candidates: set[DeviceId] = set()
+        if event.protocol is ProtocolId.PARTLOW_P1160 and len(wire) >= 3 and wire[:1] == b"L" and wire[-1:] == b"*":
+            body = wire[1:-1]
+            for width in (1, 2):
+                prefix = body[:width]
+                if len(prefix) == width and prefix.isdigit():
+                    address = int(prefix)
+                    device_id = session.routes.get((event.protocol, address))
+                    if device_id is not None:
+                        candidates.add(device_id)
+        elif event.protocol is ProtocolId.MKS_275 and len(wire) >= 4 and wire[:1] in {b"#", b"*", b"?"}:
+            try:
+                address = int(wire[1:3].decode("ascii"), 16)
+            except (UnicodeDecodeError, ValueError):
+                address = None
+            if address is not None:
+                device_id = session.routes.get((event.protocol, address))
+                if device_id is not None:
+                    candidates.add(device_id)
+        return next(iter(candidates)) if len(candidates) == 1 else None
+
+    @staticmethod
+    def _malformed_has_wire_address(event: FrameEvent) -> bool:
+        """Whether a malformed candidate contains an address-shaped prefix."""
+
+        raw = getattr(getattr(event, "error", None), "raw", b"") or event.raw_frame
+        try:
+            wire = bytes(raw)
+        except (TypeError, ValueError):
+            return False
+        if event.protocol is ProtocolId.PARTLOW_P1160:
+            return len(wire) >= 3 and wire[:1] == b"L" and wire[1:2].isdigit()
+        if event.protocol is ProtocolId.MKS_275:
+            if len(wire) < 4 or wire[:1] not in {b"#", b"*", b"?"}:
+                return False
+            try:
+                int(wire[1:3].decode("ascii"), 16)
+            except (UnicodeDecodeError, ValueError):
+                return False
+            return True
+        return False
 
     @staticmethod
     def _framer_has_pending_bytes(framer: Any) -> bool:
@@ -1282,7 +1395,7 @@ class SerialWorker:
         if values != dict(state.values):
             new_state = replace(state, values=values)
             session.runtime[pending.device_id] = new_state
-            self._notify(DeviceStateChanged(pending.device_id, None, new_state))
+            self._notify(DeviceStateChanged(pending.device_id, None, new_state, session.spec.mode))
 
     def _is_possible_echo(self, raw: bytes) -> bool:
         return bool(raw and any(raw == sent for sent in self._tx_history))

@@ -42,7 +42,7 @@ Do not enable RTS/pyserial RS-485 direction control based only on the product
 name.  Confirm the label, USB identity, wiring, and behavior on a safe bench
 setup first.
 
-## Run from a checkout
+## Python development
 
 Python 3.11 or newer with Tkinter is required by the package on Windows.  Install the
 small runtime dependencies and launch the module:
@@ -78,6 +78,87 @@ If pyserial is absent, the UI remains importable and reports a clear message
 when COM-port enumeration or a session is attempted.  A normal installation
 includes it automatically.
 
+## Quick start — Windows EXE
+
+The repository can produce `YES_RS485.exe`, a self-contained Windows one-file
+build with a GUI subsystem. To build and run it:
+
+1. Clone or download this repository.
+2. If building locally, install Python 3.11 or newer. Python is needed to
+   build the EXE, not to run the finished EXE.
+3. From the repository root, double-click `BUILD_EXE.bat`.
+4. Wait for the batch file to display `BUILD COMPLETE`.
+5. Find `YES_RS485.exe` in the repository root.
+6. Double-click `YES_RS485.exe`.
+
+The first build may take longer because it creates the isolated `.build-venv`
+environment and installs the build dependencies. The generated EXE does not
+require Python, a virtual environment, or a checkout on the target machine.
+The USB/serial adapter's Windows driver is still required.
+
+## Rebuilding the EXE
+
+After source-code changes, double-click `BUILD_EXE.bat` again. The script
+rebuilds the one-file executable in temporary `.build` output and replaces the
+old root `YES_RS485.exe` only after the new build succeeds. If a build fails,
+the previous root executable is left in place and the temporary build files are
+retained for inspection.
+
+For a manual build from the repository root:
+
+```powershell
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -e ".[build]"
+.\BUILD_EXE.bat
+```
+
+`BUILD_EXE.bat` invokes the tracked `packaging/YES_RS485.spec`. Its tiny
+packaging launcher imports the same `yes_rs485.__main__.main()` entry point
+used by normal Python execution; it does not duplicate application startup.
+PyInstaller's intermediate files and staged
+executable are written to a unique `%TEMP%\YES_RS485_build_*\dist` directory.
+The root `YES_RS485.exe` is replaced only after PyInstaller succeeds and the
+complete staged file has been copied successfully.  The temporary directory
+is retained so a failed build can be inspected.  The spec explicitly includes
+ttkbootstrap theme assets and pyserial's dynamic `serial.tools` modules; no
+application source modules are changed by the packaging step.
+
+The generated executable is ignored by Git. Do not commit the binary or the
+temporary build directory. Run `YES_RS485.exe` from the repository root after
+the build, or copy it to the intended test folder first. The EXE launches the
+same `yes_rs485.__main__` application entry point as `python -m yes_rs485`.
+
+## Shared configuration between Python and EXE
+
+The Python launch and the packaged EXE intentionally use the same per-user
+configuration file:
+
+```text
+%APPDATA%\YES_RS485\config.json
+```
+
+If Windows does not provide `APPDATA`, the application falls back to
+`%USERPROFILE%\AppData\Roaming\YES_RS485\config.json`.  The file is not bundled
+inside the executable and is not relative to the executable's folder.  This
+means a setting saved while developing with `python -m yes_rs485` is visible
+to the EXE, and vice versa, for the same Windows user account.  Keep a backup
+before testing experimental framing or address changes, and avoid saving
+settings from two running copies at the same time.  The file is schema-versioned
+and validated on load; an invalid file is reported and the application uses
+defaults rather than silently accepting malformed values.
+
+## Unsigned Windows builds
+
+Locally rebuilt executables are unsigned.  Windows SmartScreen, Defender, or
+an email/download scanner may therefore warn about `YES_RS485.exe`, especially
+when it was downloaded rather than built locally.  Treat that warning as a
+provenance check: obtain the executable from a trusted source, compare its
+checksum when one is supplied, or build it yourself from this checkout.  This
+project does not provide a signing certificate or claim that an unsigned
+binary has passed Microsoft's reputation checks.
+
 ## Serial defaults
 
 * Partlow P1160 ASCII: 9,600 baud, 7 data bits, even parity, 1 stop bit
@@ -102,6 +183,11 @@ profile.  An Advanced/Custom framing card accepts 7/8 data bits, None/Even/
 Odd parity, and 1/2 stop bits.  A non-blocking warning marks formats that are
 not documented; these controls only change the application's UART settings
 and never write a device configuration.
+
+Use **SAVE SETTINGS** to validate and persist changes immediately.  With an
+open session, the application asynchronously closes and reopens the same COM
+port in the current mode so new serial settings take effect without restarting
+the application; with a closed port, it remains closed.
 
 Flow control is disabled by default.  The application records raw bytes as
 both escaped ASCII and hexadecimal, retaining split/coalesced reads as raw

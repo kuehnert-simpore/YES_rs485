@@ -8,7 +8,7 @@ protocol-neutral values at the bottom of this module.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence
@@ -533,6 +533,8 @@ class FrameEvent:
     decoded: DecodedFrame | None = None
     error: ParseError | None = None
     flags: frozenset[str] = frozenset()
+    mode: BusMode = BusMode.PASSIVE
+    wall_time_utc: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "direction", Direction(self.direction))
@@ -540,6 +542,9 @@ class FrameEvent:
         if self.device_id is not None:
             object.__setattr__(self, "device_id", DeviceId(self.device_id))
         object.__setattr__(self, "flags", frozenset(self.flags))
+        object.__setattr__(self, "mode", BusMode(self.mode))
+        if self.wall_time_utc.tzinfo is None:
+            object.__setattr__(self, "wall_time_utc", self.wall_time_utc.replace(tzinfo=timezone.utc))
 
 
 # Adapter-only compatibility values. They are not AppConfig fields and are

@@ -9,6 +9,9 @@ description = "Small Windows RS-485 engineering utility for Partlow P1160 and MK
 requires-python = ">=3.11"
 dependencies = ["pyserial>=3.5", "ttkbootstrap>=1.10"]
 
+[project.optional-dependencies]
+build = ["pyinstaller>=6,<7"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

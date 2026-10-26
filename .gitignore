@@ -8,6 +8,8 @@ __pycache__/
 htmlcov/
 .venv/
 venv/
+.build-venv/
+.build/
 dist/
 build/
 *.egg-info/
@@ -15,5 +17,8 @@ build/
 .vscode/
 *.log
 *.tmp
+YES_RS485.exe
+YES_RS485.exe.__new
+*.spec-generated-temp
 # Local per-user configuration (the app may use %APPDATA% by default).
 config.json

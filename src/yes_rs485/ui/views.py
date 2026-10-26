@@ -7,7 +7,9 @@ configuration/runtime snapshots from :mod:`yes_rs485.ui.app`.
 
 from __future__ import annotations
 
+from collections import deque
 from datetime import datetime
+import time
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 try:
@@ -85,6 +87,12 @@ def _when(record: Any) -> str:
         return value.astimezone().strftime("%H:%M:%S.%f")[:-3]
     monotonic = _value(record, "monotonic_ns", "")
     return f"{monotonic} ns" if monotonic != "" else _text(value)
+
+
+def _format_event_time(value: Any) -> str:
+    if isinstance(value, datetime):
+        return value.astimezone().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    return _text(value) if value not in (None, "") else "—"
 
 
 def _decoded_summary(decoded: Any) -> str:
@@ -172,30 +180,41 @@ else:
             if _value(serial, "baudrate", ""):
                 serial_text = f"{_value(serial, 'baudrate', '')}/{serial_text}"
             self.serial = tk.StringVar(value=serial_text)
-            ttk.Label(self, text=f"{self.device_id}  ·  {self.protocol_text}", style="Muted.TLabel").grid(row=0, column=0, columnspan=4, sticky="w")
+            self.identity_label = ttk.Label(self, text=f"{self.device_id}  ·  {self.protocol_text}", style="Muted.TLabel")
+            self.identity_label.grid(row=0, column=0, columnspan=4, sticky="w")
             ttk.Label(self, text="Address").grid(row=1, column=0, sticky="w")
-            ttk.Label(self, textvariable=self.address).grid(row=1, column=1, sticky="w")
-            ttk.Label(self, textvariable=self.serial, style="Muted.TLabel").grid(row=1, column=2, sticky="w")
+            self.address_label = ttk.Label(self, textvariable=self.address); self.address_label.grid(row=1, column=1, sticky="w")
+            self.serial_label = ttk.Label(self, textvariable=self.serial, style="Muted.TLabel"); self.serial_label.grid(row=1, column=2, sticky="w")
             self._has_observation = False
             self.activity = tk.StringVar(value="Not observed")
             self.activity_label = ttk.Label(self, textvariable=self.activity, style="Muted.TLabel")
             self.activity_label.grid(row=1, column=3, sticky="e")
             self.last_request = tk.StringVar(value="Request —")
             self.last_response = tk.StringVar(value="Response —")
+            self.last_request_at = tk.StringVar(value="Last request —")
+            self.last_response_at = tk.StringVar(value="Last response —")
             self.last_error = tk.StringVar(value="")
             ttk.Label(self, textvariable=self.last_request, anchor="w").grid(row=2, column=0, columnspan=2, sticky="ew", pady=(4, 0))
             ttk.Label(self, textvariable=self.last_response, anchor="w").grid(row=2, column=2, columnspan=2, sticky="ew", pady=(4, 0))
+            if mode == "passive":
+                ttk.Label(self, textvariable=self.last_request_at, anchor="w", style="Muted.TLabel").grid(row=3, column=0, columnspan=2, sticky="ew")
+                ttk.Label(self, textvariable=self.last_response_at, anchor="w", style="Muted.TLabel").grid(row=3, column=2, columnspan=2, sticky="ew")
+                error_row, values_row = 4, 5
+            else:
+                error_row, values_row = 3, 4
             self._error_label = ttk.Label(self, textvariable=self.last_error, anchor="w", style="CardWarning.TLabel")
-            self._error_label.grid(row=3, column=0, columnspan=4, sticky="ew")
+            self._error_label.grid(row=error_row, column=0, columnspan=4, sticky="ew")
             self._error_label.grid_remove()
             self.values_text = tk.StringVar(value="No traffic yet · configured values")
-            ttk.Label(self, textvariable=self.values_text, anchor="w", wraplength=0, style="CardValues.TLabel").grid(row=4, column=0, columnspan=4, sticky="ew", pady=(4, 0))
+            ttk.Label(self, textvariable=self.values_text, anchor="w", wraplength=0, style="CardValues.TLabel").grid(row=values_row, column=0, columnspan=4, sticky="ew", pady=(4, 0))
             self._fields: dict[str, tk.StringVar] = {}
             self._respond = tk.BooleanVar(value=True)
             self._evidence_generation = 0
+            self._pending_request_generation: int | None = None
+            self._pending_no_response_after: str | None = None
             if mode == "master":
                 self.poll_button = ttk.Button(self, text="Poll", command=self._poll, width=7)
-                self.poll_button.grid(row=6, column=0, sticky="w", pady=(5, 0))
+                self.poll_button.grid(row=6 if mode != "passive" else 7, column=0, sticky="w", pady=(5, 0))
             elif mode == "slave":
                 values = dict(_value(device, "fake_values", {}) or {})
                 names = ("pressure", "units") if self.device_id == "gp" else ("M", "S", "W")
@@ -273,16 +292,26 @@ else:
             self.values_text.set(" · ".join(bits))
 
         def set_evidence(self, evidence: str, *, request: bool = False, response: bool = False, error: bool = False) -> None:
-            self._evidence_generation += 1
-            generation = self._evidence_generation
+            """Apply live evidence while keeping at most one timeout per card."""
             if request:
+                self._cancel_no_response_timer()
+                self._evidence_generation += 1
+                generation = self._evidence_generation
+                self._pending_request_generation = generation
                 self.last_request.set(f"Request {evidence}")
+                # A new request starts a new response wait.  Do not use the
+                # historical response text as the pending-state sentinel.
+                self.last_response.set("Response —")
                 self.last_error.set("")
                 self._error_label.grid_remove()
-                self.after(900, lambda: self._mark_no_response(generation))
+                self._pending_no_response_after = self.after(900, lambda: self._mark_no_response(generation))
             if response:
+                self._cancel_no_response_timer()
+                self._pending_request_generation = None
                 self.last_response.set(f"Response {evidence}")
             if error:
+                self._cancel_no_response_timer()
+                self._pending_request_generation = None
                 self.last_error.set(f"Error {evidence}")
                 self._error_label.grid()
             elif response:
@@ -292,16 +321,66 @@ else:
             self.activity.set("Observed")
             self.activity_label.configure(style="Status.TLabel")
 
+        def _cancel_no_response_timer(self) -> None:
+            pending = self._pending_no_response_after
+            if pending is not None:
+                try:
+                    self.after_cancel(pending)
+                except tk.TclError:
+                    pass
+                self._pending_no_response_after = None
+
         def _mark_no_response(self, generation: int) -> None:
-            if generation == self._evidence_generation and self.last_response.get() == "Response —":
+            self._pending_no_response_after = None
+            if generation == self._evidence_generation and self._pending_request_generation == generation:
+                self._pending_request_generation = None
                 self.last_error.set("Error no response")
                 self._error_label.grid()
 
+        def sync_presentation_state(self, state: Mapping[str, Any]) -> None:
+            """Render a cached state without replaying worker events.
+
+            The application owns the canonical state while this card is on a
+            hidden notebook page.  This method intentionally writes the
+            current snapshot directly, scheduling only the one pending timer
+            needed to preserve an in-flight request's no-response behavior.
+            """
+            self._cancel_no_response_timer()
+            self.set_runtime_state(state.get("values", {}), online=bool(state.get("online", False)) and bool(state.get("observed", False)))
+            self.last_request.set(str(state.get("last_request", "Request —")))
+            self.last_response.set(str(state.get("last_response", "Response —")))
+            self.last_request_at.set(f"Last request {_format_event_time(state.get('last_request_at'))}")
+            self.last_response_at.set(f"Last response {_format_event_time(state.get('last_response_at'))}")
+            self.last_error.set(str(state.get("last_error", "")))
+            if self.last_error.get():
+                self._error_label.grid()
+            else:
+                self._error_label.grid_remove()
+            self._evidence_generation = max(self._evidence_generation, int(state.get("request_generation", 0) or 0))
+            pending = state.get("pending_request_generation")
+            deadline = state.get("pending_request_deadline")
+            self._pending_request_generation = int(pending) if pending is not None else None
+            if self._pending_request_generation is not None and deadline is not None:
+                remaining_ms = int((float(deadline) - time.monotonic()) * 1000)
+                if remaining_ms <= 0:
+                    self._mark_no_response(self._pending_request_generation)
+                else:
+                    generation = self._pending_request_generation
+                    self._pending_no_response_after = self.after(remaining_ms, lambda: self._mark_no_response(generation))
+            result = state.get("result")
+            if result:
+                self.set_result(str(result), bool(state.get("result_error", False)))
+
         def set_result(self, text: str, error: bool = False) -> None:
             if error:
+                self._cancel_no_response_timer()
+                self._pending_request_generation = None
                 self.last_error.set(text)
                 self._error_label.grid()
             else:
+                if str(text).lower().startswith("response"):
+                    self._cancel_no_response_timer()
+                    self._pending_request_generation = None
                 self.last_response.set(text)
                 self.last_error.set("")
                 self._error_label.grid_remove()
@@ -321,6 +400,17 @@ else:
                 values["respond_enabled"] = bool(self._respond.get())
             return values
 
+        def apply_device_config(self, device: Any) -> None:
+            self.device = device
+            self.address.set(str(_value(device, "address", "")))
+            serial = _value(device, "serial", None)
+            serial_text = _text(_value(serial, "framing", ""))
+            if _value(serial, "baudrate", ""):
+                serial_text = f"{_value(serial, 'baudrate', '')}/{serial_text}"
+            self.serial.set(serial_text)
+            self.protocol_text = _protocol_label(_value(device, "protocol", ""))
+            self.identity_label.configure(text=f"{self.device_id}  ·  {self.protocol_text}")
+
 
     class _CardGridView(BaseView):
         def __init__(self, parent: tk.Misc, devices: Sequence[Any], **kwargs: Any) -> None:
@@ -331,6 +421,7 @@ else:
             self._grid.columnconfigure(0, weight=1)
             self._grid.rowconfigure(0, weight=1)
             self._columns = 4
+            self._layout_after: str | None = None
             self._grid.bind("<Configure>", self._responsive_layout)
 
         def _place_cards(self) -> None:
@@ -345,12 +436,29 @@ else:
             columns = 3 if width and width < 1020 else 4
             if columns != self._columns:
                 self._columns = columns
-                self._place_cards()
+                if self._layout_after is None:
+                    self._layout_after = self.after_idle(self._apply_pending_layout)
+
+        def _apply_pending_layout(self) -> None:
+            self._layout_after = None
+            self._place_cards()
 
         def update_device(self, device_id: Any, values: Any, online: bool = True) -> None:
             card = self.cards.get(_text(device_id).lower())
             if card:
                 card.set_runtime_state(_value(values, "values", values), online=online)
+
+        def apply_devices(self, devices: Sequence[Any]) -> None:
+            for device in devices:
+                key = _device_key(device)
+                card = self.cards.get(key)
+                if card is not None:
+                    card.apply_device_config(device)
+
+        def sync_device_state(self, device_id: Any, state: Mapping[str, Any]) -> None:
+            card = self.cards.get(_text(device_id).lower())
+            if card:
+                card.sync_presentation_state(state)
 
         def set_evidence(self, device_id: Any, evidence: str, **flags: bool) -> None:
             card = self.cards.get(_text(device_id).lower())
@@ -445,9 +553,11 @@ else:
     class SettingsView(BaseView):
         """Schema-2 settings: shared serial profiles, all addresses, timing, UI."""
 
-        def __init__(self, parent: tk.Misc, devices: Sequence[Any] = (), **kwargs: Any) -> None:
-            super().__init__(parent, **kwargs); self._heading("Settings", "Saved as schema 2 · serial changes apply on next open")
-            self.save_status = tk.StringVar(value="Autosave: changes are saved when the application closes · serial changes apply on next open")
+        def __init__(self, parent: tk.Misc, devices: Sequence[Any] = (), on_save: Callable[[], None] | None = None, **kwargs: Any) -> None:
+            super().__init__(parent, **kwargs); self._heading("Settings", "Saved as schema 2 · SAVE SETTINGS applies changes immediately")
+            self.on_save = on_save
+            self.save_status = tk.StringVar(value="Saved")
+            self._tracking_changes = False
             viewport = ttk.Frame(self); viewport.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(8, 0)); viewport.columnconfigure(0, weight=1); viewport.rowconfigure(0, weight=1)
             canvas = tk.Canvas(viewport, highlightthickness=0, borderwidth=0); scroll = ttk.Scrollbar(viewport, orient="vertical", command=canvas.yview); canvas.configure(yscrollcommand=scroll.set); canvas.grid(row=0, column=0, sticky="nsew"); scroll.grid(row=0, column=1, sticky="ns")
             content = ttk.Frame(canvas); content.columnconfigure(0, weight=1); content.columnconfigure(1, weight=1); window = canvas.create_window((0, 0), window=content, anchor="nw"); content.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all"))); canvas.bind("<Configure>", lambda e: canvas.itemconfigure(window, width=e.width))
@@ -470,7 +580,24 @@ else:
             self.effective_uart_summary = tk.StringVar()
             ttk.Label(content, textvariable=self.effective_uart_summary, style="Status.TLabel", wraplength=1050).grid(row=3, column=0, columnspan=2, sticky="w", pady=(10, 0))
             ttk.Label(content, text="Advanced framing applies only to a profile whose framing is set to Custom. Addresses are device properties; Partlow serial is shared by PID 1–11. Passive capture and Active Slave listen use the selected capture UART format; one UART cannot listen to both 7E1 and 8N1 at the same time.", style="Muted.TLabel", wraplength=1050).grid(row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
-            ttk.Label(content, textvariable=self.save_status, style="Status.TLabel", wraplength=1050).grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 0)); self._update_effective_uart_summary()
+            ttk.Label(content, textvariable=self.save_status, style="Status.TLabel", wraplength=1050).grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 0))
+            ttk.Button(content, text="SAVE SETTINGS", command=self._save_settings).grid(row=6, column=0, columnspan=2, sticky="w", pady=(8, 0))
+            watched = [self.theme, self.preferred_port, self.timeout, self.raw_capacity, self.cycle_delay, self.timeline_window, self.show_hex, self.passive_baudrate, self.passive_framing, self.pairing_window, self.partlow_baudrate, self.partlow_framing, self.mks_address, self.mks_baudrate, self.mks_framing, self.custom_bytesize, self.custom_parity, self.custom_stopbits, *self.partlow_addresses.values()]
+            for variable in watched:
+                variable.trace_add("write", self._mark_dirty)
+            self._tracking_changes = True
+            self._update_effective_uart_summary()
+
+        def _save_settings(self) -> None:
+            if self.on_save:
+                self.on_save()
+
+        def set_save_status(self, text: str) -> None:
+            self.save_status.set(str(text))
+
+        def _mark_dirty(self, *_args: Any) -> None:
+            if self._tracking_changes:
+                self.save_status.set("Unsaved changes")
 
         def _serial_fields(self, parent: tk.Misc, fields: Sequence[tuple[str, tk.StringVar]], framings: Sequence[str]) -> None:
             for row, (label, variable) in enumerate(fields):
@@ -518,27 +645,42 @@ else:
         def __init__(self, parent: tk.Misc, **kwargs: Any) -> None:
             super().__init__(parent, **kwargs); self._heading("Raw Traffic", "bytes are retained as received"); frame = ttk.Frame(self); frame.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(10, 0)); frame.columnconfigure(0, weight=1); frame.rowconfigure(0, weight=1)
             columns = ("seq", "time", "direction", "ascii", "hex", "flags"); self.table = ttk.Treeview(frame, columns=columns, show="headings", height=14, style="Traffic.Treeview"); self._all_columns = columns; self.show_hex = True
+            self._display_limit = 1000
+            self._item_ids: deque[str] = deque()
+            self._last_rendered_seq = 0
             for column, heading, width in (("seq", "#", 60), ("time", "Time", 105), ("direction", "Dir", 55), ("ascii", "ASCII", 250), ("hex", "Hex", 300), ("flags", "Flags", 170)):
                 self.table.heading(column, text=heading); self.table.column(column, width=width, anchor="w", stretch=column in {"ascii", "hex"})
             y = ttk.Scrollbar(frame, orient="vertical", command=self.table.yview); x = ttk.Scrollbar(frame, orient="horizontal", command=self.table.xview); self.table.configure(yscrollcommand=y.set, xscrollcommand=x.set); self.table.grid(row=0, column=0, sticky="nsew"); y.grid(row=0, column=1, sticky="ns"); x.grid(row=1, column=0, sticky="ew"); self.notice = tk.StringVar(value="No traffic captured"); ttk.Label(self, textvariable=self.notice, style="Muted.TLabel").grid(row=2, column=0, sticky="w")
 
         def set_show_hex(self, enabled: bool) -> None: self.show_hex = bool(enabled); self.table["displaycolumns"] = self._all_columns if self.show_hex else tuple(c for c in self._all_columns if c != "hex")
+        def has_rows(self) -> bool: return bool(self._item_ids)
         def add_records(self, records: Iterable[Any], dropped_before: Any = None) -> int:
             count = 0
             for record in records:
-                direction = _text(_value(record, "direction", "")).upper(); flags = _value(record, "flags", ()); flags = flags if isinstance(flags, str) else ", ".join(sorted(_text(flag) for flag in flags)); self.table.insert("", "end", values=(_value(record, "seq", ""), _when(record), direction, _ascii(_value(record, "data")), _hex(_value(record, "data")), flags), tags=(direction,) if direction in {"RX", "TX"} else ()); count += 1
-            children = self.table.get_children()
-            if len(children) > 2000: self.table.delete(*children[:len(children) - 2000])
+                try:
+                    seq = int(_value(record, "seq", 0) or 0)
+                except (TypeError, ValueError):
+                    seq = 0
+                if seq and seq <= self._last_rendered_seq:
+                    continue
+                direction = _text(_value(record, "direction", "")).upper(); flags = _value(record, "flags", ()); flags = flags if isinstance(flags, str) else ", ".join(sorted(_text(flag) for flag in flags)); item = self.table.insert("", "end", values=(_value(record, "seq", ""), _when(record), direction, _ascii(_value(record, "data")), _hex(_value(record, "data")), flags), tags=(direction,) if direction in {"RX", "TX"} else ()); self._item_ids.append(item); self._last_rendered_seq = max(self._last_rendered_seq, seq); count += 1
+            excess = len(self._item_ids) - self._display_limit
+            if excess > 0:
+                old_items = [self._item_ids.popleft() for _ in range(excess)]
+                self.table.delete(*old_items)
             if dropped_before not in (None, "", 0): self.notice.set(f"Capture gap: records before sequence {dropped_before} were dropped")
-            elif count: self.notice.set(f"{len(self.table.get_children())} records shown")
+            elif count: self.notice.set(f"{len(self._item_ids)} records shown")
             return count
-        def clear(self) -> None: self.table.delete(*self.table.get_children()); self.notice.set("No traffic captured")
+        def clear(self) -> None:
+            if self._item_ids:
+                self.table.delete(*self._item_ids)
+            self._item_ids.clear(); self._last_rendered_seq = 0; self.notice.set("No traffic captured")
 
 
     class TimelineView(BaseView):
         def __init__(self, parent: tk.Misc, **kwargs: Any) -> None:
             super().__init__(parent, **kwargs); self._heading("Bus Timeline", "decoded frames and worker events"); frame = ttk.Frame(self); frame.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(10, 0)); frame.columnconfigure(0, weight=1); frame.rowconfigure(0, weight=1)
-            columns = ("id", "time", "direction", "frame", "decoded", "status"); self.table = ttk.Treeview(frame, columns=columns, show="headings", height=14); self.window_s = 30.0; self._item_times: dict[str, int] = {}; self._timeline_origin_ns: int | None = None
+            columns = ("id", "time", "direction", "frame", "decoded", "status"); self.table = ttk.Treeview(frame, columns=columns, show="headings", height=14); self.window_s = 30.0; self._item_times: dict[str, int] = {}; self._item_ids: deque[str] = deque(); self._display_limit = 500; self._last_rendered_frame_id = 0; self._timeline_origin_ns: int | None = None
             for column, heading, width in (("id", "#", 60), ("time", "Time", 105), ("direction", "Dir", 55), ("frame", "Frame", 270), ("decoded", "Decoded", 270), ("status", "Status", 180)):
                 self.table.heading(column, text=heading); self.table.column(column, width=width, anchor="w", stretch=column in {"frame", "decoded"})
             y = ttk.Scrollbar(frame, orient="vertical", command=self.table.yview); self.table.configure(yscrollcommand=y.set); self.table.grid(row=0, column=0, sticky="nsew"); y.grid(row=0, column=1, sticky="ns"); self.notice = tk.StringVar(value="No decoded frames"); ttk.Label(self, textvariable=self.notice, style="Muted.TLabel").grid(row=2, column=0, sticky="w")
@@ -546,22 +688,36 @@ else:
             try: parsed = float(value)
             except (TypeError, ValueError): return
             if parsed > 0: self.window_s = parsed
+        def has_rows(self) -> bool: return bool(self._item_ids)
         def add_frames(self, frames: Iterable[Any]) -> int:
             count = 0
             for frame in frames:
+                try:
+                    frame_id = int(_value(frame, "frame_id", 0) or 0)
+                except (TypeError, ValueError):
+                    frame_id = 0
+                if frame_id and frame_id <= self._last_rendered_frame_id:
+                    continue
                 timestamp = _value(frame, "monotonic_ns", None); decoded = _value(frame, "decoded", None); error = _value(frame, "error", None)
                 if isinstance(timestamp, int):
                     if self._timeline_origin_ns is None: self._timeline_origin_ns = timestamp
                     time_text = f"+{(timestamp - self._timeline_origin_ns) / 1_000_000:.1f} ms"
                 else: time_text = _when(frame)
-                item = self.table.insert("", "end", values=(_value(frame, "frame_id", ""), time_text, _text(_value(frame, "direction", "")).upper(), _ascii(_value(frame, "raw_frame", b"")), _decoded_summary(decoded), f"error: {_text(error)}" if error else "ok"));
+                item = self.table.insert("", "end", values=(_value(frame, "frame_id", ""), time_text, _text(_value(frame, "direction", "")).upper(), _ascii(_value(frame, "raw_frame", b"")), _decoded_summary(decoded), f"error: {_text(error)}" if error else "ok")); self._item_ids.append(item); self._last_rendered_frame_id = max(self._last_rendered_frame_id, frame_id)
                 if isinstance(timestamp, int): self._item_times[item] = timestamp
                 count += 1
-            children = self.table.get_children()
-            if len(children) > 2000: self.table.delete(*children[:len(children) - 2000])
-            if count: self.notice.set(f"{len(self.table.get_children())} frames shown")
+            excess = len(self._item_ids) - self._display_limit
+            if excess > 0:
+                old_items = [self._item_ids.popleft() for _ in range(excess)]
+                self.table.delete(*old_items)
+                for item in old_items:
+                    self._item_times.pop(item, None)
+            if count: self.notice.set(f"{len(self._item_ids)} frames shown")
             return count
-        def clear(self) -> None: self.table.delete(*self.table.get_children()); self._item_times.clear(); self._timeline_origin_ns = None; self.notice.set("No decoded frames")
+        def clear(self) -> None:
+            if self._item_ids:
+                self.table.delete(*self._item_ids)
+            self._item_ids.clear(); self._item_times.clear(); self._last_rendered_frame_id = 0; self._timeline_origin_ns = None; self.notice.set("No decoded frames")
 
 
 __all__ = ["BaseView", "DeviceCard", "PassiveView", "MasterView", "SlaveView", "SettingsView", "RawTrafficView", "TimelineView"]

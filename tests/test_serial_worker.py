@@ -184,6 +184,47 @@ def test_poll_targets_device_address_and_reuses_one_handle(worker, endpoint):
     assert first != second
 
 
+def test_master_malformed_response_is_attached_only_to_pending_target(worker, endpoint):
+    open_worker(worker, make_spec())
+    worker.poll(DeviceId.PID_1)
+    wait_for(lambda: len(endpoint.writes) == 1)
+    feed_poll_response(endpoint, endpoint.writes[-1])
+    wait_for(lambda: worker.pending_transaction_id is None)
+
+    worker.poll(DeviceId.PID_2)
+    wait_for(lambda: len(endpoint.writes) == 2)
+    endpoint.incoming.append(b"L3Mnot-a-data-field*")
+    wait_for(lambda: worker.pending_transaction_id is None)
+
+    malformed = [frame for frame in worker.drain_frames().frames if frame.error is not None]
+    assert malformed
+    event = malformed[-1]
+    assert event.device_id is DeviceId.PID_2
+    assert event.transaction_id is not None
+    failures = [item for item in worker.drain_notifications() if isinstance(item, TransactionFailed)]
+    assert failures and failures[-1].device_id is DeviceId.PID_2
+
+
+@pytest.mark.parametrize("raw", (b"L2Mnot-a-data-field*", b"L99Mnot-a-data-field*"))
+def test_master_malformed_other_or_unknown_address_does_not_fail_pending(worker, endpoint, raw):
+    open_worker(worker, make_spec(response_timeout_s=0.20))
+    worker.poll(DeviceId.PID_2)
+    wait_for(lambda: len(endpoint.writes) == 1)
+    endpoint.incoming.append(raw)
+
+    frames = []
+    def collect_malformed() -> bool:
+        frames.extend(worker.drain_frames().frames)
+        return any(frame.error is not None for frame in frames)
+    wait_for(collect_malformed)
+    assert worker.pending_transaction_id is not None
+    malformed = [frame for frame in frames if frame.error is not None]
+    assert malformed
+    assert malformed[-1].device_id is None
+    assert malformed[-1].transaction_id is None
+    wait_for(lambda: worker.pending_transaction_id is None)
+
+
 def test_poll_all_continues_after_timeout_and_completes_cycle(worker, endpoint):
     open_worker(worker, make_spec(response_timeout_s=0.01))
     worker.poll_all_once()
